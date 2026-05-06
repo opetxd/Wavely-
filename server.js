@@ -1,156 +1,86 @@
-// ═══════════════════════════════════════════
-//  Wavely — server.js
-//  Backend proxy for iTunes Search API (free, no key)
-//  Run: node server.js
-// ═══════════════════════════════════════════
+const express = require("express");
+const cors = require("cors");
 
-const http  = require('http');
-const https = require('https');
-const url   = require('url');
-const fs    = require('fs');
-const path  = require('path');
+const app = express();
+app.use(cors());
+app.use(express.static("."));
 
-const PORT = process.env.PORT || 3000;
+const DEEZER = "https://api.deezer.com";
 
-// ── CORS ──────────────────────────────────
-function cors(res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-}
-
-// ── iTunes fetch ──────────────────────────
-function itunes(endpoint) {
-  return new Promise((resolve, reject) => {
-    https.get('https://itunes.apple.com' + endpoint, resp => {
-      let raw = '';
-      resp.on('data', c => raw += c);
-      resp.on('end', () => {
-        try { resolve(JSON.parse(raw)); }
-        catch (e) { reject(new Error('iTunes parse error')); }
-      });
-    }).on('error', reject);
-  });
-}
-
-// ── Transform ─────────────────────────────
-function song(t) {
+// Helper: normalize track from Deezer response
+function normalizeTrack(t) {
   return {
-    id:          t.trackId,
-    title:       t.trackName        || 'Unknown',
-    artist:      t.artistName       || 'Unknown',
-    album:       t.collectionName   || 'Unknown',
-    cover:       (t.artworkUrl100 || '').replace('100x100', '600x600'),
-    coverSmall:  t.artworkUrl100    || '',
-    preview:     t.previewUrl       || null,
-    duration:    Math.floor((t.trackTimeMillis || 0) / 1000),
-    genre:       t.primaryGenreName || '',
-    releaseDate: (t.releaseDate || '').split('T')[0],
+    id: t.id,
+    title: t.title,
+    artist: t.artist?.name || (typeof t.artist === "string" ? t.artist : "Unknown"),
+    album: t.album?.title || "",
+    cover: t.album?.cover_medium || t.album?.cover || "",
+    preview: t.preview || "",
+    duration: t.duration || 30,
+    link: t.link || "",
   };
 }
 
-// ── Route handlers ────────────────────────
-const routes = {
-
-  // /api/search?q=dua+lipa&limit=20
-  '/api/search': async q => {
-    const term   = encodeURIComponent(q.q || 'pop');
-    const limit  = clamp(q.limit, 5, 50, 20);
-    const entity = q.type || 'song';
-    const data   = await itunes(`/search?term=${term}&entity=${entity}&limit=${limit}&media=music`);
-    return { results: (data.results || []).map(song), total: data.resultCount };
-  },
-
-  // /api/trending?genre=pop&limit=10
-  '/api/trending': async q => {
-    const genre = encodeURIComponent(q.genre || 'pop hits');
-    const limit = clamp(q.limit, 5, 25, 10);
-    const data  = await itunes(`/search?term=${genre}&entity=song&limit=${limit}&media=music`);
-    return { results: (data.results || []).map(song) };
-  },
-
-  // /api/new?genre=rnb&limit=10
-  '/api/new': async q => {
-    const genre = encodeURIComponent((q.genre || 'rnb') + ' ' + new Date().getFullYear());
-    const limit = clamp(q.limit, 5, 25, 10);
-    const data  = await itunes(`/search?term=${genre}&entity=song&limit=${limit}&media=music`);
-    return { results: (data.results || []).map(song) };
-  },
-
-  // /api/charts?country=us&limit=20
-  '/api/charts': async q => {
-    const country = q.country || 'us';
-    const limit   = clamp(q.limit, 5, 100, 20);
-    const data    = await itunes(`/search?term=top+hits&entity=song&limit=${limit}&media=music&country=${country}`);
-    return { results: (data.results || []).map(song) };
-  },
-
-  // /api/artist?name=taylor+swift
-  '/api/artist': async q => {
-    const name  = encodeURIComponent(q.name || '');
-    const limit = clamp(q.limit, 5, 25, 10);
-    const data  = await itunes(`/search?term=${name}&entity=song&limit=${limit}&media=music`);
-    return { results: (data.results || []).map(song) };
-  },
-
-  // /api/album?artist=dua+lipa&name=future+nostalgia
-  '/api/album': async q => {
-    const term = encodeURIComponent([(q.artist || ''), (q.name || '')].join(' ').trim());
-    const data = await itunes(`/search?term=${term}&entity=song&limit=20&media=music`);
-    return { results: (data.results || []).map(song) };
-  },
-};
-
-// ── Utility ───────────────────────────────
-function clamp(val, min, max, def) {
-  const n = parseInt(val);
-  return isNaN(n) ? def : Math.min(max, Math.max(min, n));
-}
-
-function send(res, status, body, type = 'application/json') {
-  res.writeHead(status, { 'Content-Type': type });
-  res.end(typeof body === 'string' ? body : JSON.stringify(body));
-}
-
-// ── Server ────────────────────────────────
-const server = http.createServer(async (req, res) => {
-  const parsed   = url.parse(req.url, true);
-  const pathname = parsed.pathname;
-
-  cors(res);
-  if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
-
-  // Serve index.html
-  if (pathname === '/' || pathname === '/index.html') {
-    const file = path.join(__dirname, 'index.html');
-    if (fs.existsSync(file)) {
-      res.writeHead(200, { 'Content-Type': 'text/html' });
-      fs.createReadStream(file).pipe(res);
-    } else {
-      send(res, 404, 'index.html not found', 'text/plain');
-    }
-    return;
+// GET /api/trending - Chart global
+app.get("/api/trending", async (req, res) => {
+  try {
+    const response = await fetch(`${DEEZER}/chart/0/tracks?limit=50`);
+    const data = await response.json();
+    const tracks = (data.data || []).map(normalizeTrack);
+    res.json({ tracks });
+  } catch (e) {
+    res.status(500).json({ error: "Failed to fetch trending", tracks: [] });
   }
-
-  // API routes
-  if (routes[pathname]) {
-    try {
-      const result = await routes[pathname](parsed.query);
-      send(res, 200, result);
-    } catch (err) {
-      console.error('[API Error]', pathname, err.message);
-      send(res, 502, { error: 'Upstream error', message: err.message });
-    }
-    return;
-  }
-
-  send(res, 404, { error: 'Not found' });
 });
 
-server.listen(PORT, () => {
-  console.log('\n🎵  Wavely server started');
-  console.log(`    http://localhost:${PORT}\n`);
-  console.log('    Routes:');
-  Object.keys(routes).forEach(r => console.log(`    GET ${r}`));
-  console.log('');
+// GET /api/search/:q - Search tracks
+app.get("/api/search/:q", async (req, res) => {
+  try {
+    const q = encodeURIComponent(req.params.q);
+    const response = await fetch(`${DEEZER}/search?q=${q}&limit=50&output=json`);
+    const data = await response.json();
+    const tracks = (data.data || []).map(normalizeTrack);
+    res.json({ tracks });
+  } catch (e) {
+    res.status(500).json({ error: "Search failed", tracks: [] });
+  }
 });
+
+// GET /api/genre/:name - Search by genre keyword
+app.get("/api/genre/:name", async (req, res) => {
+  try {
+    const q = encodeURIComponent(req.params.name);
+    const response = await fetch(`${DEEZER}/search?q=${q}&limit=50`);
+    const data = await response.json();
+    const tracks = (data.data || []).map(normalizeTrack);
+    res.json({ tracks });
+  } catch (e) {
+    res.status(500).json({ error: "Genre fetch failed", tracks: [] });
+  }
+});
+
+// GET /api/artist/:id - Get artist top tracks
+app.get("/api/artist/:id", async (req, res) => {
+  try {
+    const response = await fetch(`${DEEZER}/artist/${req.params.id}/top?limit=20`);
+    const data = await response.json();
+    const tracks = (data.data || []).map(normalizeTrack);
+    res.json({ tracks });
+  } catch (e) {
+    res.status(500).json({ error: "Artist fetch failed", tracks: [] });
+  }
+});
+
+// GET /api/new - New releases
+app.get("/api/new", async (req, res) => {
+  try {
+    const response = await fetch(`${DEEZER}/chart/0/albums?limit=20`);
+    const data = await response.json();
+    res.json({ albums: data.data || [] });
+  } catch (e) {
+    res.status(500).json({ error: "New releases failed", albums: [] });
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`SoundWave API running on http://localhost:${PORT}`));
